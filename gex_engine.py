@@ -30,7 +30,7 @@ def calculate_bs_gamma(S: float, K: float, T: float, r: float, sigma: float) -> 
     return gamma
 
 
-def process_gex_analysi(df: pd.DataFrame, spot_price: float, lot_size: int = 25, r: float = 0.07) -> Dict[str, Any]:
+def process_gex_analysis(df: pd.DataFrame, spot_price: float, lot_size: int = 25, r: float = 0.07) -> Dict[str, Any]:
     """
     Processes the option chain dataframe to calculate GEX metrics across strikes.
     
