@@ -1,158 +1,224 @@
 """
-nse_fetcher.py — Robust NSE Option Chain Data Fetcher
-Handles session cookie initialization, cloud server anti-bot bypass,
-and error handling for Streamlit deployment.
+nse_fetcher.py — robust NSE option-chain adapter.
+
+The dashboard can request a specific expiry:
+    get_option_chain("NIFTY", expiry="18-Aug-2026")
+
+PNSEA supports filtering the option chain by expiry_date, which is important
+because the default option_chain() response can return the nearest-expiry
+chain while still reporting the list of all available expiries.
 """
 
 from __future__ import annotations
+
 import time
-import pandas as pd
-from typing import Tuple, Dict, Any, Optional
+from typing import Any
+
+# --- FIX: Compatibility patch for PNSEA and curl_cffi ---
+try:
+    import curl_cffi.requests
+    if not hasattr(curl_cffi.requests, "RequestException"):
+        try:
+            from curl_cffi.requests.errors import RequestsError
+            curl_cffi.requests.RequestException = RequestsError
+        except Exception:
+            curl_cffi.requests.RequestException = Exception
+except Exception:
+    pass
+# ---------------------------------------------------------
 
 try:
-    from curl_cffi import requests as impersonate_requests
-    CURL_CFFI_AVAILABLE = True
-except ImportError:
-    import requests as impersonate_requests
-    CURL_CFFI_AVAILABLE = False
+    from pnsea import NSE
+except ImportError as exc:
+    raise ImportError(
+        "PNSEA is not installed. Run: python -m pip install -U pnsea==1.1"
+    ) from exc
 
 
-class NSEFetcher:
-    """Fetches real-time option chain data from NSE India with automated session management."""
+SUPPORTED_SYMBOLS = {"NIFTY", "BANKNIFTY", "FINNIFTY", "MIDCPNIFTY"}
 
-    BASE_URL = "https://www.nseindia.com"
-    API_URL_INDEX = "https://www.nseindia.com/api/option-chain-indices?symbol="
 
-    HEADERS = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
-        "Accept": "application/json, text/plain, */*",
-        "Accept-Language": "en-US,en;q=0.9",
-        "Accept-Encoding": "gzip, deflate, br",
-        "Referer": "https://www.nseindia.com/option-chain",
-    }
+class NseSession:
+    """Persistent PNSEA-backed NSE session used by dashboard.py."""
 
     def __init__(self):
-        self.session = None
-        self._init_session()
+        self.nse = NSE()
+        self._last_fetch = 0.0
+        self._min_interval = 3.0
 
-    def _init_session(self):
-        """Initializes a browser-impersonated session to acquire valid cookies."""
+    @staticmethod
+    def _clean_number(value: Any, default: float = 0.0) -> float:
+        if value is None:
+            return default
         try:
-            if CURL_CFFI_AVAILABLE:
-                self.session = impersonate_requests.Session(impersonate="chrome120")
-            else:
-                import requests
-                self.session = requests.Session()
+            if value != value:
+                return default
+            return float(value)
+        except (TypeError, ValueError):
+            return default
 
-            self.session.headers.update(self.HEADERS)
-            # Warm up session by visiting home page first
-            resp = self.session.get(self.BASE_URL, timeout=10)
-            if resp.status_code != 200:
-                time.sleep(1)
-                self.session.get(self.BASE_URL, timeout=10)
-        except Exception:
-            self.session = None
+    def _respect_rate_limit(self):
+        elapsed = time.monotonic() - self._last_fetch
+        if elapsed < self._min_interval:
+            time.sleep(self._min_interval - elapsed)
 
-    def fetch_raw_data(self, symbol: str = "NIFTY", retries: int = 3) -> Optional[Dict[str, Any]]:
-        """Fetches raw option chain JSON from NSE API with retry attempts."""
-        symbol = symbol.upper()
-        url = f"{self.API_URL_INDEX}{symbol}"
+    def _fetch_once(self, symbol: str, expiry: str | None = None):
+        self._respect_rate_limit()
 
-        for attempt in range(retries):
+        if expiry:
+            result = self.nse.options.option_chain(
+                symbol,
+                expiry_date=expiry,
+            )
+        else:
+            result = self.nse.options.option_chain(symbol)
+
+        self._last_fetch = time.monotonic()
+
+        if not isinstance(result, (tuple, list)) or len(result) < 3:
+            raise RuntimeError(
+                f"Unexpected PNSEA option-chain response for {symbol}."
+            )
+
+        df, expiries, underlying = result[0], result[1], result[2]
+
+        if df is None or getattr(df, "empty", True):
+            suffix = f" for expiry {expiry}" if expiry else ""
+            raise RuntimeError(
+                f"NSE returned an empty option chain for {symbol}{suffix}."
+            )
+
+        if not expiries:
+            raise RuntimeError(f"NSE returned no expiry dates for {symbol}.")
+
+        return df, list(expiries), self._clean_number(underlying)
+
+    def get_option_chain(
+        self,
+        symbol="NIFTY",
+        retries=3,
+        expiry: str | None = None,
+    ):
+        """
+        Return raw JSON compatible with the existing signals.py.
+
+        Supported symbols:
+            NIFTY, BANKNIFTY, FINNIFTY, MIDCPNIFTY
+
+        expiry:
+            Optional NSE expiry string such as '18-Aug-2026'.
+        """
+        symbol = str(symbol).upper().strip()
+
+        if symbol not in SUPPORTED_SYMBOLS:
+            raise RuntimeError(
+                f"Unsupported index '{symbol}'. "
+                f"Use one of: {', '.join(sorted(SUPPORTED_SYMBOLS))}"
+            )
+
+        last_error = None
+
+        for attempt in range(1, retries + 1):
             try:
-                if self.session is None:
-                    self._init_session()
+                df, expiries, underlying = self._fetch_once(
+                    symbol,
+                    expiry=expiry,
+                )
 
-                if self.session is None:
-                    continue
+                # When a specific expiry was requested, that is the expiry
+                # represented by the returned DataFrame.
+                selected_expiry = str(expiry) if expiry else str(expiries[0])
 
-                response = self.session.get(url, timeout=10)
+                rows = []
 
-                if response and response.status_code == 200:
-                    return response.json()
+                for _, row in df.iterrows():
+                    strike = self._clean_number(row.get("strikePrice"))
+                    if strike <= 0:
+                        continue
 
-                # If cookie expired, re-initialize session and retry
-                if response and response.status_code in [401, 403]:
-                    self._init_session()
-                    time.sleep(1)
+                    ce = {
+                        "openInterest": self._clean_number(
+                            row.get("CE_openInterest")
+                        ),
+                        "changeinOpenInterest": self._clean_number(
+                            row.get("CE_changeinOpenInterest")
+                        ),
+                        "totalTradedVolume": self._clean_number(
+                            row.get("CE_totalTradedVolume")
+                        ),
+                        "impliedVolatility": self._clean_number(
+                            row.get("CE_impliedVolatility")
+                        ),
+                        "lastPrice": self._clean_number(
+                            row.get("CE_lastPrice")
+                        ),
+                    }
 
-            except Exception:
-                self._init_session()
-                time.sleep(1)
+                    pe = {
+                        "openInterest": self._clean_number(
+                            row.get("PE_openInterest")
+                        ),
+                        "changeinOpenInterest": self._clean_number(
+                            row.get("PE_changeinOpenInterest")
+                        ),
+                        "totalTradedVolume": self._clean_number(
+                            row.get("PE_totalTradedVolume")
+                        ),
+                        "impliedVolatility": self._clean_number(
+                            row.get("PE_impliedVolatility")
+                        ),
+                        "lastPrice": self._clean_number(
+                            row.get("PE_lastPrice")
+                        ),
+                    }
 
-        return None
+                    rows.append(
+                        {
+                            "expiryDate": selected_expiry,
+                            "strikePrice": strike,
+                            "CE": ce,
+                            "PE": pe,
+                        }
+                    )
 
+                if not rows:
+                    raise RuntimeError(
+                        f"NSE returned no usable strike rows for "
+                        f"{symbol} / {selected_expiry}."
+                    )
 
-def fetch_nse_option_chain(symbol: str = "NIFTY") -> Tuple[pd.DataFrame, float]:
-    """
-    Fetches and processes NSE Option Chain into a standard DataFrame with TTE calculation.
-    
-    Returns:
-        Tuple[pd.DataFrame, spot_price]
-    """
-    fetcher = NSEFetcher()
-    raw_data = fetcher.fetch_raw_data(symbol)
+                return {
+                    "records": {
+                        "underlyingValue": underlying,
+                        "expiryDates": expiries,
+                        "data": rows,
+                    }
+                }
 
-    if not raw_data or "records" not in raw_data:
+            except Exception as exc:
+                last_error = str(exc)
+                if attempt < retries:
+                    time.sleep(2.0 * attempt)
+
+        suffix = f" / {expiry}" if expiry else ""
         raise RuntimeError(
-            f"NSE API block detected for {symbol}. Cloud IP (Streamlit) was restricted by NSE firewall. "
-            f"Please refresh the page or try running locally."
+            f"Failed to fetch NSE option chain for {symbol}{suffix}: "
+            f"{last_error}"
         )
 
-    records = raw_data["records"]
-    spot_price = float(records.get("underlyingValue", 0.0))
-    expiry_dates = records.get("expiryDates", [])
 
-    if not expiry_dates:
-        raise ValueError("No expiry dates found in NSE response.")
+if __name__ == "__main__":
+    session = NseSession()
 
-    target_expiry = expiry_dates[0]  # Select nearest expiry
-    data_list = records.get("data", [])
+    # Test nearest expiry.
+    data = session.get_option_chain("NIFTY")
+    records = data["records"]
+    print("Underlying spot:", records["underlyingValue"])
+    print("Expiry dates:", records["expiryDates"][:3])
+    print("Nearest expiry strikes:", len(records["data"]))
 
-    chain_rows = []
-    
-    # Calculate Days to Expiry (DTE) and Time to Expiration (TTE in years)
-    today = pd.Timestamp.now().normalize()
-    try:
-        exp_date = pd.to_datetime(target_expiry, format="%d-%b-%Y")
-        dte = max((exp_date - today).days, 0.5)
-    except Exception:
-        dte = 1.0
-    
-    tte = dte / 365.0  # Annualized time to expiration
-
-    for item in data_list:
-        if item.get("expiryDate") != target_expiry:
-            continue
-
-        strike = float(item.get("strikePrice", 0))
-        ce = item.get("CE", {})
-        pe = item.get("PE", {})
-
-        call_oi = float(ce.get("openInterest", 0))
-        put_oi = float(pe.get("openInterest", 0))
-
-        # Handle IV values safely (convert percentage to decimal)
-        call_iv = float(ce.get("impliedVolatility", 0.0)) / 100.0
-        put_iv = float(pe.get("impliedVolatility", 0.0)) / 100.0
-
-        # Fallback default IV if zero
-        if call_iv <= 0:
-            call_iv = 0.15
-        if put_iv <= 0:
-            put_iv = 0.15
-
-        chain_rows.append({
-            "strikePrice": strike,
-            "call_oi": call_oi,
-            "put_oi": put_oi,
-            "call_iv": call_iv,
-            "put_iv": put_iv,
-            "tte": tte,
-        })
-
-    if not chain_rows:
-        raise ValueError(f"No option chain data available for near expiry: {target_expiry}")
-
-    df = pd.DataFrame(chain_rows)
-    return df, spot_price
+    # Test a selectable expiry if available.
+    if len(records["expiryDates"]) > 1:
+        target = records["expiryDates"][1]
+        selected = session.get_option_chain("NIFTY", expiry=target)
+        print(f"{target} strikes:", len(selected["records"]["data"]))
