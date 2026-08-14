@@ -1,6 +1,6 @@
 """
-nse_fetcher.py — Robust NSE Option Chain Fetcher using PNSEA.
-Compatible with Streamlit caching and multi-expiry selection.
+nse_fetcher.py — Robust NSE option-chain adapter powered by PNSEA.
+Handles automatic session regeneration on cookie expiration.
 """
 
 from __future__ import annotations
@@ -9,7 +9,7 @@ import time
 from typing import Any, Tuple, Optional
 import pandas as pd
 
-# --- Compatibility patch for PNSEA and curl_cffi ---
+# --- FIX: Compatibility patch for PNSEA and curl_cffi ---
 try:
     import curl_cffi.requests
     if not hasattr(curl_cffi.requests, "RequestException"):
@@ -20,13 +20,13 @@ try:
             curl_cffi.requests.RequestException = Exception
 except Exception:
     pass
-# ---------------------------------------------------
+# ---------------------------------------------------------
 
 try:
     from pnsea import NSE
 except ImportError as exc:
     raise ImportError(
-        "PNSEA is not installed. Ensure 'pnsea==1.1' is listed in requirements.txt"
+        "PNSEA is not installed. Ensure 'pnsea==1.1' is in requirements.txt"
     ) from exc
 
 
@@ -34,19 +34,25 @@ SUPPORTED_SYMBOLS = {"NIFTY", "BANKNIFTY", "FINNIFTY", "MIDCPNIFTY"}
 
 
 class NseSession:
-    """Persistent PNSEA-backed NSE session manager."""
+    """PNSEA session manager with dynamic session refresh."""
 
     def __init__(self):
-        self.nse = NSE()
+        self._init_nse()
         self._last_fetch = 0.0
-        self._min_interval = 3.0
+        self._min_interval = 2.0
+
+    def _init_nse(self):
+        try:
+            self.nse = NSE()
+        except Exception:
+            self.nse = None
 
     @staticmethod
     def _clean_number(value: Any, default: float = 0.0) -> float:
         if value is None:
             return default
         try:
-            if value != value:  # NaN check
+            if value != value:
                 return default
             return float(value)
         except (TypeError, ValueError):
@@ -60,24 +66,24 @@ class NseSession:
     def _fetch_once(self, symbol: str, expiry: str | None = None):
         self._respect_rate_limit()
 
-        try:
-            if expiry:
-                result = self.nse.options.option_chain(symbol, expiry_date=expiry)
-            else:
-                result = self.nse.options.option_chain(symbol)
-        except Exception as err:
-            raise RuntimeError(f"NSE network request failed: {err}")
+        if self.nse is None:
+            self._init_nse()
+
+        if expiry:
+            result = self.nse.options.option_chain(symbol, expiry_date=expiry)
+        else:
+            result = self.nse.options.option_chain(symbol)
 
         self._last_fetch = time.monotonic()
 
         if not isinstance(result, (tuple, list)) or len(result) < 3:
-            raise RuntimeError(f"Invalid option-chain response structure for {symbol}.")
+            raise RuntimeError(f"Unexpected PNSEA response format for {symbol}.")
 
         df, expiries, underlying = result[0], result[1], result[2]
 
         if df is None or getattr(df, "empty", True):
             suffix = f" for expiry {expiry}" if expiry else ""
-            raise RuntimeError(f"NSE returned an empty option chain for {symbol}{suffix}.")
+            raise RuntimeError(f"NSE returned empty data for {symbol}{suffix}.")
 
         if not expiries:
             raise RuntimeError(f"NSE returned no expiry dates for {symbol}.")
@@ -86,51 +92,62 @@ class NseSession:
 
     def get_option_chain(
         self,
-        symbol: str = "NIFTY",
-        retries: int = 3,
+        symbol="NIFTY",
+        retries=3,
         expiry: str | None = None,
-    ) -> dict:
-        """Fetches option chain data with error recovery."""
+    ):
         symbol = str(symbol).upper().strip()
 
         if symbol not in SUPPORTED_SYMBOLS:
             raise RuntimeError(
-                f"Unsupported symbol '{symbol}'. Use one of: {', '.join(sorted(SUPPORTED_SYMBOLS))}"
+                f"Unsupported index '{symbol}'. "
+                f"Use one of: {', '.join(sorted(SUPPORTED_SYMBOLS))}"
             )
 
-        last_error = ""
+        last_error = None
+
         for attempt in range(1, retries + 1):
             try:
-                df, expiries, underlying = self._fetch_once(symbol, expiry=expiry)
-                selected_expiry = str(expiry) if expiry else str(expiries[0])
+                df, expiries, underlying = self._fetch_once(
+                    symbol,
+                    expiry=expiry,
+                )
 
+                selected_expiry = str(expiry) if expiry else str(expiries[0])
                 rows = []
+
                 for _, row in df.iterrows():
                     strike = self._clean_number(row.get("strikePrice"))
                     if strike <= 0:
                         continue
 
-                    rows.append({
-                        "expiryDate": selected_expiry,
-                        "strikePrice": strike,
-                        "CE": {
-                            "openInterest": self._clean_number(row.get("CE_openInterest")),
-                            "changeinOpenInterest": self._clean_number(row.get("CE_changeinOpenInterest")),
-                            "totalTradedVolume": self._clean_number(row.get("CE_totalTradedVolume")),
-                            "impliedVolatility": self._clean_number(row.get("CE_impliedVolatility")),
-                            "lastPrice": self._clean_number(row.get("CE_lastPrice")),
-                        },
-                        "PE": {
-                            "openInterest": self._clean_number(row.get("PE_openInterest")),
-                            "changeinOpenInterest": self._clean_number(row.get("PE_changeinOpenInterest")),
-                            "totalTradedVolume": self._clean_number(row.get("PE_totalTradedVolume")),
-                            "impliedVolatility": self._clean_number(row.get("PE_impliedVolatility")),
-                            "lastPrice": self._clean_number(row.get("PE_lastPrice")),
-                        },
-                    })
+                    ce = {
+                        "openInterest": self._clean_number(row.get("CE_openInterest")),
+                        "changeinOpenInterest": self._clean_number(row.get("CE_changeinOpenInterest")),
+                        "totalTradedVolume": self._clean_number(row.get("CE_totalTradedVolume")),
+                        "impliedVolatility": self._clean_number(row.get("CE_impliedVolatility")),
+                        "lastPrice": self._clean_number(row.get("CE_lastPrice")),
+                    }
+
+                    pe = {
+                        "openInterest": self._clean_number(row.get("PE_openInterest")),
+                        "changeinOpenInterest": self._clean_number(row.get("PE_changeinOpenInterest")),
+                        "totalTradedVolume": self._clean_number(row.get("PE_totalTradedVolume")),
+                        "impliedVolatility": self._clean_number(row.get("PE_impliedVolatility")),
+                        "lastPrice": self._clean_number(row.get("PE_lastPrice")),
+                    }
+
+                    rows.append(
+                        {
+                            "expiryDate": selected_expiry,
+                            "strikePrice": strike,
+                            "CE": ce,
+                            "PE": pe,
+                        }
+                    )
 
                 if not rows:
-                    raise RuntimeError(f"No valid strike rows returned for {symbol}.")
+                    raise RuntimeError(f"No valid strike data for {symbol}.")
 
                 return {
                     "records": {
@@ -142,14 +159,19 @@ class NseSession:
 
             except Exception as exc:
                 last_error = str(exc)
+                # Re-initialize session on error (cookie refresh)
+                self._init_nse()
                 if attempt < retries:
-                    time.sleep(2.0 * attempt)
+                    time.sleep(1.5 * attempt)
 
-        raise RuntimeError(f"Failed to fetch NSE option chain for {symbol}: {last_error}")
+        suffix = f" / {expiry}" if expiry else ""
+        raise RuntimeError(
+            f"Failed to fetch NSE option chain for {symbol}{suffix}: {last_error}"
+        )
 
 
 def fetch_nse_option_chain(symbol: str = "NIFTY", expiry: Optional[str] = None) -> Tuple[pd.DataFrame, float]:
-    """DataFrame extraction helper for dashboard integration."""
+    """Helper for fetching option chain directly into a DataFrame."""
     session = NseSession()
     raw_data = session.get_option_chain(symbol=symbol, expiry=expiry)
 
