@@ -1,5 +1,5 @@
 """
-dashboard.py — Quantitative GEX Terminal with Safe Tabular Rendering
+dashboard.py — Quantitative GEX Terminal with Safe Data Handling
 """
 
 import pandas as pd
@@ -21,7 +21,7 @@ def fetch_cached_option_chain(symbol: str, expiry: str | None = None):
     session = NseSession()
     return session.get_option_chain(symbol=symbol, expiry=expiry)
 
-# Sidebar
+# Sidebar Controls
 st.sidebar.title("⚡ Quantitative GEX Terminal")
 symbol = st.sidebar.selectbox("Select Index", sorted(SUPPORTED_SYMBOLS), index=0)
 
@@ -39,6 +39,7 @@ try:
     else:
         data = fetch_cached_option_chain(symbol, expiry=selected_expiry)
 
+    # Process metrics and signals
     metrics = process_gex_analysis(data, symbol)
     signals = generate_signal_report(metrics)
 
@@ -98,11 +99,12 @@ try:
 
     st.markdown("---")
 
-    # 4. GEX Tabular Display (Safe Iteration - Fixes dict apply error)
+    # 4. GEX Tabular Display (Safe Iteration preventing dict/apply errors)
     st.subheader("📋 Strike-Level GEX Tabular Display")
-    df_gex = metrics["gex_df"]
+    
+    df_gex = metrics.get("gex_df")
     if not isinstance(df_gex, pd.DataFrame):
-        df_gex = pd.DataFrame(df_gex)
+        df_gex = pd.DataFrame(df_gex if df_gex is not None else [])
 
     def safe_format(val, fmt="₹{:,.0f}", default="₹0"):
         try:
@@ -113,18 +115,19 @@ try:
             return default
 
     display_data = []
-    for _, row in df_gex.iterrows():
-        display_data.append({
-            "Strike Price": safe_format(row.get("strike"), "₹{:,.0f}"),
-            "Call OI": safe_format(row.get("call_oi"), "{:,.0f}", "0"),
-            "Put OI": safe_format(row.get("put_oi"), "{:,.0f}", "0"),
-            "Call Gamma": safe_format(row.get("call_gamma"), "{:.6f}", "0.000000"),
-            "Put Gamma": safe_format(row.get("put_gamma"), "{:.6f}", "0.000000"),
-            "Call GEX (₹ Cr)": safe_format(row.get("call_gex", 0) / 1e7, "₹{:,.2f} Cr"),
-            "Put GEX (₹ Cr)": safe_format(row.get("put_gex", 0) / 1e7, "₹{:,.2f} Cr"),
-            "Net GEX (₹ Cr)": safe_format(row.get("net_gex", 0) / 1e7, "₹{:,.2f} Cr"),
-            "GEX Dominance": str(row.get("dominance", "Neutral")),
-        })
+    if not df_gex.empty:
+        for _, row in df_gex.iterrows():
+            display_data.append({
+                "Strike Price": safe_format(row.get("strike"), "₹{:,.0f}"),
+                "Call OI": safe_format(row.get("call_oi"), "{:,.0f}", "0"),
+                "Put OI": safe_format(row.get("put_oi"), "{:,.0f}", "0"),
+                "Call Gamma": safe_format(row.get("call_gamma"), "{:.6f}", "0.000000"),
+                "Put Gamma": safe_format(row.get("put_gamma"), "{:.6f}", "0.000000"),
+                "Call GEX (₹ Cr)": safe_format(row.get("call_gex", 0) / 1e7, "₹{:,.2f} Cr"),
+                "Put GEX (₹ Cr)": safe_format(row.get("put_gex", 0) / 1e7, "₹{:,.2f} Cr"),
+                "Net GEX (₹ Cr)": safe_format(row.get("net_gex", 0) / 1e7, "₹{:,.2f} Cr"),
+                "GEX Dominance": str(row.get("dominance", "Neutral")),
+            })
 
     display_df = pd.DataFrame(display_data)
 
@@ -138,20 +141,22 @@ try:
     # 5. Interactive GEX Profile Chart
     st.subheader("📊 Net Gamma Exposure Profile")
     fig = go.Figure()
-    colors = ['#16a34a' if g >= 0 else '#dc2626' for g in df_gex['net_gex']]
     
-    fig.add_trace(go.Bar(
-        x=df_gex['strike'],
-        y=df_gex['net_gex'] / 1e7,
-        marker_color=colors,
-        name="Net GEX (₹ Cr)",
-        hovertemplate="Strike: %{x}<br>Net GEX: ₹%{y:.2f} Cr<extra></extra>"
-    ))
+    if not df_gex.empty and 'net_gex' in df_gex.columns:
+        colors = ['#16a34a' if g >= 0 else '#dc2626' for g in df_gex['net_gex']]
+        
+        fig.add_trace(go.Bar(
+            x=df_gex['strike'],
+            y=df_gex['net_gex'] / 1e7,
+            marker_color=colors,
+            name="Net GEX (₹ Cr)",
+            hovertemplate="Strike: %{x}<br>Net GEX: ₹%{y:.2f} Cr<extra></extra>"
+        ))
 
-    fig.add_vline(x=metrics['spot_price'], line_width=2, line_dash="dash", line_color="#2563eb", annotation_text="Spot")
-    fig.add_vline(x=metrics['gamma_flip'], line_width=2, line_color="#f59e0b", annotation_text="Gamma Flip")
-    fig.add_vline(x=metrics['call_wall'], line_width=1.5, line_color="#16a34a", annotation_text="Call Wall")
-    fig.add_vline(x=metrics['put_wall'], line_width=1.5, line_color="#dc2626", annotation_text="Put Wall")
+        fig.add_vline(x=metrics['spot_price'], line_width=2, line_dash="dash", line_color="#2563eb", annotation_text="Spot")
+        fig.add_vline(x=metrics['gamma_flip'], line_width=2, line_color="#f59e0b", annotation_text="Gamma Flip")
+        fig.add_vline(x=metrics['call_wall'], line_width=1.5, line_color="#16a34a", annotation_text="Call Wall")
+        fig.add_vline(x=metrics['put_wall'], line_width=1.5, line_color="#dc2626", annotation_text="Put Wall")
 
     fig.update_layout(xaxis_title="Strike Price", yaxis_title="Net GEX (₹ Cr)", template="plotly_white", height=450)
     st.plotly_chart(fig, use_container_width=True)
