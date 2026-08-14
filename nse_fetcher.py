@@ -1,8 +1,5 @@
 """
 nse_fetcher.py — Robust NSE option-chain adapter powered by PNSEA.
-
-Supports selecting specific expiries and returns data formatted for the 
-Quantitative GEX Engine.
 """
 
 from __future__ import annotations
@@ -11,7 +8,6 @@ import time
 from typing import Any, Tuple, Optional
 import pandas as pd
 
-# --- FIX: Compatibility patch for PNSEA and curl_cffi ---
 try:
     import curl_cffi.requests
     if not hasattr(curl_cffi.requests, "RequestException"):
@@ -22,7 +18,6 @@ try:
             curl_cffi.requests.RequestException = Exception
 except Exception:
     pass
-# ---------------------------------------------------------
 
 try:
     from pnsea import NSE
@@ -48,7 +43,7 @@ class NseSession:
         if value is None:
             return default
         try:
-            if value != value:  # NaN check
+            if value != value:
                 return default
             return float(value)
         except (TypeError, ValueError):
@@ -96,7 +91,6 @@ class NseSession:
         retries=3,
         expiry: str | None = None,
     ):
-        """Returns raw JSON-style structure compatible with option chain parsers."""
         symbol = str(symbol).upper().strip()
 
         if symbol not in SUPPORTED_SYMBOLS:
@@ -174,12 +168,7 @@ class NseSession:
 
 
 def fetch_nse_option_chain(symbol: str = "NIFTY", expiry: Optional[str] = None) -> Tuple[pd.DataFrame, float]:
-    """
-    Standard interface used by dashboard.py to extract (DataFrame, Spot Price).
-    
-    Returns:
-        Tuple[pd.DataFrame, float]: Structured option chain DataFrame & spot price.
-    """
+    """Helper function for dashboard compatibility."""
     session = NseSession()
     raw_data = session.get_option_chain(symbol=symbol, expiry=expiry)
 
@@ -190,7 +179,6 @@ def fetch_nse_option_chain(symbol: str = "NIFTY", expiry: Optional[str] = None) 
 
     target_expiry = expiry if expiry else expiry_dates[0]
 
-    # Calculate Time to Expiration (TTE in years)
     today = pd.Timestamp.now().normalize()
     try:
         exp_date = pd.to_datetime(target_expiry, format="%d-%b-%Y")
@@ -228,12 +216,3 @@ def fetch_nse_option_chain(symbol: str = "NIFTY", expiry: Optional[str] = None) 
 
     df = pd.DataFrame(chain_rows)
     return df, spot_price
-
-
-if __name__ == "__main__":
-    session = NseSession()
-    data = session.get_option_chain("NIFTY")
-    records = data["records"]
-    print("Underlying spot:", records["underlyingValue"])
-    print("Expiry dates:", records["expiryDates"][:3])
-    print("Nearest expiry strikes:", len(records["data"]))
