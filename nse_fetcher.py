@@ -1,18 +1,15 @@
 """
-nse_fetcher.py — robust NSE option-chain adapter.
+nse_fetcher.py — Robust NSE option-chain adapter powered by PNSEA.
 
-The dashboard can request a specific expiry:
-    get_option_chain("NIFTY", expiry="18-Aug-2026")
-
-PNSEA supports filtering the option chain by expiry_date, which is important
-because the default option_chain() response can return the nearest-expiry
-chain while still reporting the list of all available expiries.
+Supports selecting specific expiries and returns data formatted for the 
+Quantitative GEX Engine.
 """
 
 from __future__ import annotations
 
 import time
-from typing import Any
+from typing import Any, Tuple, Optional
+import pandas as pd
 
 # --- FIX: Compatibility patch for PNSEA and curl_cffi ---
 try:
@@ -31,7 +28,7 @@ try:
     from pnsea import NSE
 except ImportError as exc:
     raise ImportError(
-        "PNSEA is not installed. Run: python -m pip install -U pnsea==1.1"
+        "PNSEA is not installed. Ensure 'pnsea>=1.1' is in requirements.txt"
     ) from exc
 
 
@@ -39,7 +36,7 @@ SUPPORTED_SYMBOLS = {"NIFTY", "BANKNIFTY", "FINNIFTY", "MIDCPNIFTY"}
 
 
 class NseSession:
-    """Persistent PNSEA-backed NSE session used by dashboard.py."""
+    """Persistent PNSEA-backed NSE session used by the dashboard."""
 
     def __init__(self):
         self.nse = NSE()
@@ -51,7 +48,7 @@ class NseSession:
         if value is None:
             return default
         try:
-            if value != value:
+            if value != value:  # NaN check
                 return default
             return float(value)
         except (TypeError, ValueError):
@@ -99,15 +96,7 @@ class NseSession:
         retries=3,
         expiry: str | None = None,
     ):
-        """
-        Return raw JSON compatible with the existing signals.py.
-
-        Supported symbols:
-            NIFTY, BANKNIFTY, FINNIFTY, MIDCPNIFTY
-
-        expiry:
-            Optional NSE expiry string such as '18-Aug-2026'.
-        """
+        """Returns raw JSON-style structure compatible with option chain parsers."""
         symbol = str(symbol).upper().strip()
 
         if symbol not in SUPPORTED_SYMBOLS:
@@ -125,8 +114,6 @@ class NseSession:
                     expiry=expiry,
                 )
 
-                # When a specific expiry was requested, that is the expiry
-                # represented by the returned DataFrame.
                 selected_expiry = str(expiry) if expiry else str(expiries[0])
 
                 rows = []
@@ -137,39 +124,19 @@ class NseSession:
                         continue
 
                     ce = {
-                        "openInterest": self._clean_number(
-                            row.get("CE_openInterest")
-                        ),
-                        "changeinOpenInterest": self._clean_number(
-                            row.get("CE_changeinOpenInterest")
-                        ),
-                        "totalTradedVolume": self._clean_number(
-                            row.get("CE_totalTradedVolume")
-                        ),
-                        "impliedVolatility": self._clean_number(
-                            row.get("CE_impliedVolatility")
-                        ),
-                        "lastPrice": self._clean_number(
-                            row.get("CE_lastPrice")
-                        ),
+                        "openInterest": self._clean_number(row.get("CE_openInterest")),
+                        "changeinOpenInterest": self._clean_number(row.get("CE_changeinOpenInterest")),
+                        "totalTradedVolume": self._clean_number(row.get("CE_totalTradedVolume")),
+                        "impliedVolatility": self._clean_number(row.get("CE_impliedVolatility")),
+                        "lastPrice": self._clean_number(row.get("CE_lastPrice")),
                     }
 
                     pe = {
-                        "openInterest": self._clean_number(
-                            row.get("PE_openInterest")
-                        ),
-                        "changeinOpenInterest": self._clean_number(
-                            row.get("PE_changeinOpenInterest")
-                        ),
-                        "totalTradedVolume": self._clean_number(
-                            row.get("PE_totalTradedVolume")
-                        ),
-                        "impliedVolatility": self._clean_number(
-                            row.get("PE_impliedVolatility")
-                        ),
-                        "lastPrice": self._clean_number(
-                            row.get("PE_lastPrice")
-                        ),
+                        "openInterest": self._clean_number(row.get("PE_openInterest")),
+                        "changeinOpenInterest": self._clean_number(row.get("PE_changeinOpenInterest")),
+                        "totalTradedVolume": self._clean_number(row.get("PE_totalTradedVolume")),
+                        "impliedVolatility": self._clean_number(row.get("PE_impliedVolatility")),
+                        "lastPrice": self._clean_number(row.get("PE_lastPrice")),
                     }
 
                     rows.append(
@@ -202,23 +169,71 @@ class NseSession:
 
         suffix = f" / {expiry}" if expiry else ""
         raise RuntimeError(
-            f"Failed to fetch NSE option chain for {symbol}{suffix}: "
-            f"{last_error}"
+            f"Failed to fetch NSE option chain for {symbol}{suffix}: {last_error}"
         )
+
+
+def fetch_nse_option_chain(symbol: str = "NIFTY", expiry: Optional[str] = None) -> Tuple[pd.DataFrame, float]:
+    """
+    Standard interface used by dashboard.py to extract (DataFrame, Spot Price).
+    
+    Returns:
+        Tuple[pd.DataFrame, float]: Structured option chain DataFrame & spot price.
+    """
+    session = NseSession()
+    raw_data = session.get_option_chain(symbol=symbol, expiry=expiry)
+
+    records = raw_data["records"]
+    spot_price = float(records.get("underlyingValue", 0.0))
+    expiry_dates = records.get("expiryDates", [])
+    data_list = records.get("data", [])
+
+    target_expiry = expiry if expiry else expiry_dates[0]
+
+    # Calculate Time to Expiration (TTE in years)
+    today = pd.Timestamp.now().normalize()
+    try:
+        exp_date = pd.to_datetime(target_expiry, format="%d-%b-%Y")
+        dte = max((exp_date - today).days, 0.5)
+    except Exception:
+        dte = 1.0
+
+    tte = dte / 365.0
+
+    chain_rows = []
+    for item in data_list:
+        strike = float(item.get("strikePrice", 0))
+        ce = item.get("CE", {}) or {}
+        pe = item.get("PE", {}) or {}
+
+        call_oi = float(ce.get("openInterest", 0))
+        put_oi = float(pe.get("openInterest", 0))
+
+        call_iv = float(ce.get("impliedVolatility", 0.0) or 0.0) / 100.0
+        put_iv = float(pe.get("impliedVolatility", 0.0) or 0.0) / 100.0
+
+        if call_iv <= 0:
+            call_iv = 0.15
+        if put_iv <= 0:
+            put_iv = 0.15
+
+        chain_rows.append({
+            "strikePrice": strike,
+            "call_oi": call_oi,
+            "put_oi": put_oi,
+            "call_iv": call_iv,
+            "put_iv": put_iv,
+            "tte": tte,
+        })
+
+    df = pd.DataFrame(chain_rows)
+    return df, spot_price
 
 
 if __name__ == "__main__":
     session = NseSession()
-
-    # Test nearest expiry.
     data = session.get_option_chain("NIFTY")
     records = data["records"]
     print("Underlying spot:", records["underlyingValue"])
     print("Expiry dates:", records["expiryDates"][:3])
     print("Nearest expiry strikes:", len(records["data"]))
-
-    # Test a selectable expiry if available.
-    if len(records["expiryDates"]) > 1:
-        target = records["expiryDates"][1]
-        selected = session.get_option_chain("NIFTY", expiry=target)
-        print(f"{target} strikes:", len(selected["records"]["data"]))
