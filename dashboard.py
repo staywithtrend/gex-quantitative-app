@@ -17,26 +17,34 @@ st.set_page_config(
     initial_sidebar_state="expanded",
 )
 
-@st.cache_resource
-def get_session():
-    return NseSession()
-
-session = get_session()
+# --- CACHED FETCH FUNCTION (TTL = 30 seconds) ---
+# Prevents spamming NSE when interacting with Streamlit sidebar/widgets
+@st.cache_data(ttl=30, show_spinner="Fetching Live NSE Option Chain...")
+def fetch_cached_option_chain(symbol: str, expiry: str | None = None):
+    session = NseSession()
+    return session.get_option_chain(symbol=symbol, expiry=expiry)
 
 # Sidebar
 st.sidebar.title("⚡ Quantitative GEX Terminal")
 symbol = st.sidebar.selectbox("Select Index", sorted(SUPPORTED_SYMBOLS), index=0)
 
+if st.sidebar.button("🔄 Refresh Market Data"):
+    st.cache_data.clear()
+
 try:
-    initial_data = session.get_option_chain(symbol)
+    # 1. Fetch initial chain (default nearest expiry)
+    initial_data = fetch_cached_option_chain(symbol)
     expiries = initial_data["records"]["expiryDates"]
+    
     selected_expiry = st.sidebar.selectbox("Select Expiry", expiries)
     
-    if st.sidebar.button("🔄 Refresh Market Data"):
-        st.cache_data.clear()
+    # 2. Reuse initial data if nearest expiry selected, otherwise fetch chosen expiry
+    if selected_expiry == expiries[0]:
+        data = initial_data
+    else:
+        data = fetch_cached_option_chain(symbol, expiry=selected_expiry)
 
     # Data Processing
-    data = session.get_option_chain(symbol, expiry=selected_expiry)
     metrics = process_gex_analysis(data, symbol)
     signals = generate_signal_report(metrics)
 
