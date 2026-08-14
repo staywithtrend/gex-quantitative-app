@@ -1,136 +1,103 @@
 """
-gex_engine.py — Quantitative GEX & Level Analytics Engine
+gex_engine.py — Quantitative Option Gamma Exposure (GEX) Engine
+Calculates strike-level Black-Scholes Gamma, Dealer GEX (in ₹ Crores),
+Call/Put Walls, Zero Gamma Flip level, and Point B target trajectories.
 """
 
 from __future__ import annotations
-
-from datetime import datetime
 import numpy as np
 import pandas as pd
 from scipy.stats import norm
-
-LOT_SIZES = {
-    "NIFTY": 65,
-    "BANKNIFTY": 30,
-    "FINNIFTY": 60,
-    "MIDCPNIFTY": 120,
-}
+from typing import Dict, Any
 
 
-def black_scholes_gamma(S: float, K: float, T: float, r: float, sigma: float) -> float:
-    """Calculates Black-Scholes Option Gamma."""
-    if S <= 0 or K <= 0 or T <= 0 or sigma <= 0:
+def calculate_bs_gamma(S: float, K: float, T: float, r: float, sigma: float) -> float:
+    """
+    Calculates standard Black-Scholes Gamma for an option strike.
+    
+    Parameters:
+        S : Spot Price
+        K : Strike Price
+        T : Time to Expiration in Years (tte)
+        r : Risk-free Interest Rate
+        sigma : Implied Volatility (decimal format, e.g., 0.15 for 15%)
+    """
+    if T <= 0 or sigma <= 0 or S <= 0 or K <= 0:
         return 0.0
-
+    
     d1 = (np.log(S / K) + (r + 0.5 * sigma**2) * T) / (sigma * np.sqrt(T))
     gamma = norm.pdf(d1) / (S * sigma * np.sqrt(T))
-    return float(gamma)
+    return gamma
 
 
-def calculate_days_to_expiry(expiry_str: str) -> float:
-    """Parses NSE date format to time-to-expiry in years (T)."""
-    try:
-        exp_date = datetime.strptime(expiry_str, "%d-%b-%Y")
-        now = datetime.now()
-        days = (exp_date - now).days + ((15.5 - now.hour) / 24.0)
-        return max(days / 365.0, 0.001)
-    except Exception:
-        return 0.007
-
-
-def process_gex_analysis(raw_data: dict, symbol: str, risk_free_rate: float = 0.07) -> dict:
+def process_gex_chain(df: pd.DataFrame, spot_price: float, lot_size: int = 25, r: float = 0.07) -> Dict[str, Any]:
     """
-    Computes strike-level metrics, GEX Dominance, Call/Put Walls, Zero Gamma,
-    and Point A -> Point B breakout extension targets.
+    Processes the option chain dataframe to calculate GEX metrics across strikes.
+    
+    Expected DataFrame Columns:
+        - strikePrice (float)
+        - call_oi (int/float)
+        - put_oi (int/float)
+        - call_iv (float)
+        - put_iv (float)
+        - tte (float, time to expiration in years)
     """
-    records = raw_data.get("records", {})
-    spot_price = float(records.get("underlyingValue", 0.0))
-    strikes_data = records.get("data", [])
-    lot_size = LOT_SIZES.get(symbol.upper(), 50)
+    df = df.copy()
 
-    if not strikes_data or spot_price <= 0:
-        raise ValueError("Invalid option chain or spot price data.")
+    # 1. Compute Strike-Level Black-Scholes Gamma
+    df["call_gamma"] = df.apply(
+        lambda row: calculate_bs_gamma(spot_price, row["strikePrice"], row["tte"], r, row["call_iv"]),
+        axis=1,
+    )
+    df["put_gamma"] = df.apply(
+        lambda row: calculate_bs_gamma(spot_price, row["strikePrice"], row["tte"], r, row["put_iv"]),
+        axis=1,
+    )
 
-    rows = []
-    for item in strikes_data:
-        strike = float(item["strikePrice"])
-        expiry_str = item["expiryDate"]
-        T = calculate_days_to_expiry(expiry_str)
+    # 2. Compute Dealer GEX in ₹ Crores per Strike
+    # SpotGamma Dealer Model:
+    # Dealers are Short Calls -> Negative Gamma impact (trend amplifying on upside)
+    # Dealers are Short Puts -> Positive Gamma impact (stabilizing / dampening)
+    # GEX (₹ Cr) = (OI * Lot Size * Gamma * Spot^2 * 0.01) / 10,000,000
+    df["call_gex_cr"] = -1.0 * (df["call_oi"] * lot_size * df["call_gamma"] * (spot_price**2) * 0.01) / 1e7
+    df["put_gex_cr"] = (df["put_oi"] * lot_size * df["put_gamma"] * (spot_price**2) * 0.01) / 1e7
+    df["net_gex_cr"] = df["call_gex_cr"] + df["put_gex_cr"]
 
-        # Call Metrics
-        ce_oi = float(item["CE"]["openInterest"])
-        ce_iv = float(item["CE"]["impliedVolatility"]) / 100.0
-        ce_gamma = black_scholes_gamma(spot_price, strike, T, risk_free_rate, ce_iv)
-        call_gex = ce_oi * lot_size * ce_gamma * (spot_price**2) * 0.01
+    # 3. Aggregate Total Net Market GEX
+    total_net_gex = df["net_gex_cr"].sum()
 
-        # Put Metrics
-        pe_oi = float(item["PE"]["openInterest"])
-        pe_iv = float(item["PE"]["impliedVolatility"]) / 100.0
-        pe_gamma = black_scholes_gamma(spot_price, strike, T, risk_free_rate, pe_iv)
-        put_gex = -1.0 * (pe_oi * lot_size * pe_gamma * (spot_price**2) * 0.01)
+    # 4. Identify Structural Walls (Peak Open Interest Strikes)
+    call_wall = float(df.loc[df["call_oi"].idxmax(), "strikePrice"])
+    put_wall = float(df.loc[df["put_oi"].idxmax(), "strikePrice"])
 
-        net_gex = call_gex + put_gex
+    # 5. Calculate Zero Gamma Flip Level (Nearest Sign Crossing to Spot)
+    df_sorted = df.sort_values("strikePrice").reset_index(drop=True)
+    
+    # Identify index rows where Net GEX changes sign
+    df_sorted["sign"] = np.sign(df_sorted["net_gex_cr"])
+    sign_changes = df_sorted[df_sorted["sign"].diff().fillna(0) != 0]
 
-        # Dominance Classification
-        if call_gex > abs(put_gex) * 1.3:
-            dominance = "Call Heavy 🟢"
-        elif abs(put_gex) > call_gex * 1.3:
-            dominance = "Put Heavy 🔴"
-        else:
-            dominance = "Neutral ⚪"
-
-        rows.append({
-            "strike": strike,
-            "call_oi": ce_oi,
-            "put_oi": pe_oi,
-            "call_gamma": ce_gamma,
-            "put_gamma": pe_gamma,
-            "call_gex": call_gex,
-            "put_gex": put_gex,
-            "net_gex": net_gex,
-            "dominance": dominance,
-        })
-
-    df = pd.DataFrame(rows).sort_values("strike").reset_index(drop=True)
-
-    # Filter for active trading band (±12% around spot)
-    lower_bound = spot_price * 0.88
-    upper_bound = spot_price * 1.12
-    df_filtered = df[(df["strike"] >= lower_bound) & (df["strike"] <= upper_bound)].copy()
-
-    # Identify Key Walls
-    call_wall = float(df_filtered.loc[df_filtered["call_gex"].idxmax()]["strike"])
-    put_wall = float(df_filtered.loc[df_filtered["put_gex"].idxmin()]["strike"])
-
-    # Zero Gamma / Gamma Flip Level
-    df_filtered["cum_gex"] = df_filtered["net_gex"].cumsum()
-    zero_crossings = df_filtered[np.sign(df_filtered["cum_gex"]).diff() != 0]
-
-    if not zero_crossings.empty:
-        gamma_flip = float(zero_crossings.iloc[0]["strike"])
+    if not sign_changes.empty:
+        # Select the zero crossing strike closest to current spot price
+        closest_idx = (sign_changes["strikePrice"] - spot_price).abs().idxmin()
+        gamma_flip = float(sign_changes.loc[closest_idx, "strikePrice"])
     else:
-        gamma_flip = spot_price
+        # Fallback to current spot if chain GEX is uniformly one sign
+        gamma_flip = float(spot_price)
 
-    # Point B Target Calculations (Next high-volume/GEX concentration strikes)
-    upside_candidates = df_filtered[df_filtered["strike"] > call_wall]
-    if not upside_candidates.empty:
-        point_b_upside = float(upside_candidates.loc[upside_candidates["call_gex"].idxmax()]["strike"])
-    else:
-        point_b_upside = call_wall + (call_wall - put_wall) * 0.5
-
-    downside_candidates = df_filtered[df_filtered["strike"] < put_wall]
-    if not downside_candidates.empty:
-        point_b_downside = float(downside_candidates.loc[downside_candidates["put_gex"].idxmin()]["strike"])
-    else:
-        point_b_downside = put_wall - (call_wall - put_wall) * 0.5
+    # 6. Calculate Point B Target Trajectories
+    # Point B projection based on 50% expansion of the Call-Put Wall structure
+    wall_span = max(call_wall - put_wall, spot_price * 0.01)
+    point_b_upside = float(call_wall + (wall_span * 0.5))
+    point_b_downside = float(put_wall - (wall_span * 0.5))
 
     return {
-        "spot_price": spot_price,
-        "total_net_gex": float(df_filtered["net_gex"].sum()),
-        "gamma_flip": gamma_flip,
+        "spot_price": float(spot_price),
+        "total_net_gex": float(total_net_gex),
         "call_wall": call_wall,
         "put_wall": put_wall,
+        "gamma_flip": gamma_flip,
         "point_b_upside": point_b_upside,
         "point_b_downside": point_b_downside,
-        "gex_df": df_filtered,
+        "chain_data": df_sorted,
     }
