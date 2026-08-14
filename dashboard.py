@@ -1,6 +1,5 @@
 """
-dashboard.py — Quantitative GEX Terminal with Tabular Analytics & Signals
-Run: streamlit run dashboard.py
+dashboard.py — Quantitative GEX Terminal with Safe Tabular Rendering
 """
 
 import pandas as pd
@@ -17,8 +16,6 @@ st.set_page_config(
     initial_sidebar_state="expanded",
 )
 
-# --- CACHED FETCH FUNCTION (TTL = 30 seconds) ---
-# Prevents spamming NSE when interacting with Streamlit sidebar/widgets
 @st.cache_data(ttl=30, show_spinner="Fetching Live NSE Option Chain...")
 def fetch_cached_option_chain(symbol: str, expiry: str | None = None):
     session = NseSession()
@@ -32,19 +29,16 @@ if st.sidebar.button("🔄 Refresh Market Data"):
     st.cache_data.clear()
 
 try:
-    # 1. Fetch initial chain (default nearest expiry)
     initial_data = fetch_cached_option_chain(symbol)
     expiries = initial_data["records"]["expiryDates"]
     
     selected_expiry = st.sidebar.selectbox("Select Expiry", expiries)
     
-    # 2. Reuse initial data if nearest expiry selected, otherwise fetch chosen expiry
     if selected_expiry == expiries[0]:
         data = initial_data
     else:
         data = fetch_cached_option_chain(symbol, expiry=selected_expiry)
 
-    # Data Processing
     metrics = process_gex_analysis(data, symbol)
     signals = generate_signal_report(metrics)
 
@@ -84,7 +78,7 @@ try:
 
     st.markdown("---")
 
-    # 3. Quantitative Breakout & Level Engine (Point A -> Point B)
+    # 3. Quantitative Breakout & Level Engine
     st.subheader("🚀 Quantitative Breakout & Trending Level Engine")
     bk = signals["breakout_info"]
 
@@ -104,22 +98,35 @@ try:
 
     st.markdown("---")
 
-    # 4. GEX Tabular Display
+    # 4. GEX Tabular Display (Safe Iteration - Fixes dict apply error)
     st.subheader("📋 Strike-Level GEX Tabular Display")
-    df_gex = metrics["gex_df"].copy()
+    df_gex = metrics["gex_df"]
+    if not isinstance(df_gex, pd.DataFrame):
+        df_gex = pd.DataFrame(df_gex)
 
-    # Format columns for display
-    display_df = pd.DataFrame({
-        "Strike Price": df_gex["strike"].map("₹{:,.0f}".format),
-        "Call OI": df_gex["call_oi"].map("{:,.0f}".format),
-        "Put OI": df_gex["put_oi"].map("{:,.0f}".format),
-        "Call Gamma": df_gex["call_gamma"].map("{:.6f}".format),
-        "Put Gamma": df_gex["put_gamma"].map("{:.6f}".format),
-        "Call GEX (₹ Cr)": (df_gex["call_gex"] / 1e7).map("₹{:,.2f}".format),
-        "Put GEX (₹ Cr)": (df_gex["put_gex"] / 1e7).map("₹{:,.2f}".format),
-        "Net GEX (₹ Cr)": (df_gex["net_gex"] / 1e7).map("₹{:,.2f}".format),
-        "GEX Dominance": df_gex["dominance"],
-    })
+    def safe_format(val, fmt="₹{:,.0f}", default="₹0"):
+        try:
+            if val is None or pd.isna(val):
+                return default
+            return fmt.format(float(val))
+        except (ValueError, TypeError):
+            return default
+
+    display_data = []
+    for _, row in df_gex.iterrows():
+        display_data.append({
+            "Strike Price": safe_format(row.get("strike"), "₹{:,.0f}"),
+            "Call OI": safe_format(row.get("call_oi"), "{:,.0f}", "0"),
+            "Put OI": safe_format(row.get("put_oi"), "{:,.0f}", "0"),
+            "Call Gamma": safe_format(row.get("call_gamma"), "{:.6f}", "0.000000"),
+            "Put Gamma": safe_format(row.get("put_gamma"), "{:.6f}", "0.000000"),
+            "Call GEX (₹ Cr)": safe_format(row.get("call_gex", 0) / 1e7, "₹{:,.2f} Cr"),
+            "Put GEX (₹ Cr)": safe_format(row.get("put_gex", 0) / 1e7, "₹{:,.2f} Cr"),
+            "Net GEX (₹ Cr)": safe_format(row.get("net_gex", 0) / 1e7, "₹{:,.2f} Cr"),
+            "GEX Dominance": str(row.get("dominance", "Neutral")),
+        })
+
+    display_df = pd.DataFrame(display_data)
 
     st.dataframe(
         display_df,
